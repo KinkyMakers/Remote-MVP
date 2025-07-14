@@ -244,6 +244,17 @@ volatile float fusedPitch = 0.0;
 volatile float fusedYaw = 0.0;
 volatile unsigned long lastFusionUpdate = 0;
 
+// Orientation detection variables
+volatile bool isFlipped = false;
+volatile bool wasFlipped = false;
+volatile bool orientationChanged = false;
+volatile unsigned long lastOrientationCheck = 0;
+volatile bool doubleVibeActive = false;
+volatile unsigned long doubleVibeStart = 0;
+volatile int doubleVibeStep = 0;
+volatile unsigned long lastOrientationChange = 0; // For debouncing
+volatile int orientationStableCount = 0; // Count stable readings
+
 // Buzzer and vibrator pattern state
 volatile bool buzzerActive = false;
 volatile unsigned long buzzerStart = 0;
@@ -276,6 +287,10 @@ const int marioCoinNotes[] = {1319, 1568, 2637};
 const int marioCoinDurations[] = {60, 60, 120};
 const int marioCoinLength = 3;
 
+// Double vibration pattern for flip detection (on/off in ms)
+const int doubleVibePattern[] = { 200, 100, 200, 100, 0 }; // Two vibrations with pause
+const int doubleVibeLength = 4;
+
 void playMarioCoin() {
   for (int i = 0; i < marioCoinLength; ++i) {
     tone(BUZZER_PIN, marioCoinNotes[i]);
@@ -283,6 +298,70 @@ void playMarioCoin() {
     noTone(BUZZER_PIN);
     delay(20);
   }
+}
+
+// Orientation detection function
+void checkOrientation() {
+  // Check orientation every 50ms to avoid too frequent checks
+  unsigned long now = millis();
+  if (now - lastOrientationCheck < 50) return;
+  lastOrientationCheck = now;
+  
+  // Use Z-axis accelerometer to detect orientation with hysteresis
+  // When face up (normal): Z should be positive (~1g)
+  // When flipped over: Z should be negative (~-1g)
+  float flipThreshold = -0.3;  // Threshold to detect flipped (Z < -0.3g)
+  float normalThreshold = 0.3; // Threshold to detect normal (Z > 0.3g)
+  
+  bool currentlyFlipped;
+  if (wasFlipped) {
+    // If currently flipped, need Z > 0.3g to return to normal
+    currentlyFlipped = (imuZ < normalThreshold);
+  } else {
+    // If currently normal, need Z < -0.3g to flip
+    currentlyFlipped = (imuZ < flipThreshold);
+  }
+  
+  // Debug output every second
+  static unsigned long lastDebugOutput = 0;
+  if (now - lastDebugOutput > 1000) {
+    Serial.printf("Orientation Debug: Z=%.3f, Flipped=%s, Stable=%d\n", 
+                 imuZ, currentlyFlipped ? "YES" : "NO", orientationStableCount);
+    lastDebugOutput = now;
+  }
+  
+  // Debouncing: require stable reading for 200ms before changing state
+  if (currentlyFlipped == wasFlipped) {
+    orientationStableCount++;
+  } else {
+    orientationStableCount = 0;
+  }
+  
+  // Only change state if stable for 4 readings (200ms) and enough time since last change
+  if (orientationStableCount >= 4 && (now - lastOrientationChange) > 500) {
+    if (currentlyFlipped != isFlipped) {
+      Serial.printf("Orientation CHANGE: Z=%.3f, %s -> %s\n", 
+                   imuZ, isFlipped ? "FLIPPED" : "NORMAL", 
+                   currentlyFlipped ? "FLIPPED" : "NORMAL");
+      
+      isFlipped = currentlyFlipped;
+      lastOrientationChange = now;
+      
+      if (currentlyFlipped) {
+        // Just flipped over - trigger double vibration
+        Serial.println(">>> TRIGGERING DOUBLE VIBRATION <<<");
+        doubleVibeActive = true;
+        doubleVibeStart = millis();
+        doubleVibeStep = 0;
+      } else {
+        // Just flipped back to normal - play Mario coin sound
+        Serial.println(">>> TRIGGERING MARIO COIN SOUND <<<");
+        playMarioCoin();
+      }
+    }
+  }
+  
+  wasFlipped = currentlyFlipped;
 }
 
 // Task handles
@@ -454,6 +533,9 @@ void dashboardTask(void *param) {
     // Read IMU data
     readIMU();
     
+    // Check orientation and trigger feedback
+    checkOrientation();
+    
     // Update LEDs
     for (int i = 0; i < NUM_LEDS; i++) {
       leds[i] = CHSV(hue, 255, brightness);
@@ -611,6 +693,15 @@ void dashboardTask(void *param) {
     }
     tft.setTextColor(ST77XX_WHITE);
     tft.print(" ");
+    if (isFlipped) {
+      tft.setTextColor(ST77XX_RED);
+      tft.print("FLIP");
+    } else {
+      tft.setTextColor(ST77XX_GREEN);
+      tft.print("NORM");
+    }
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(" ");
     tft.print(millis() / 1000);
     tft.print("s");
     
@@ -655,6 +746,29 @@ void dashboardTask(void *param) {
         } else {
           digitalWrite(VIBRATOR_PIN, LOW);
           vibeActive = false;
+        }
+      }
+    } else if (doubleVibeActive) {
+      // Handle double vibration for orientation detection
+      unsigned long now = millis();
+      unsigned long elapsed = now - doubleVibeStart;
+      unsigned long totalTime = 0;
+      
+      for (int i = 0; i < doubleVibeStep; i++) {
+        totalTime += doubleVibePattern[i];
+      }
+      
+      if (elapsed >= totalTime) {
+        if (doubleVibeStep < doubleVibeLength) {
+          if (doubleVibePattern[doubleVibeStep] > 0) {
+            digitalWrite(VIBRATOR_PIN, HIGH);
+          } else {
+            digitalWrite(VIBRATOR_PIN, LOW);
+          }
+          doubleVibeStep++;
+        } else {
+          digitalWrite(VIBRATOR_PIN, LOW);
+          doubleVibeActive = false;
         }
       }
     } else {
