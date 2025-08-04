@@ -8,6 +8,10 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include "LSM6DS3_Simple.h"
+#include <SPIFFS.h> // Added for SPIFFS
+#include <esp_now.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
 
 // Pin definitions (from Board Config.md)
 #define TFT_CS   4   // Screen Cable Select
@@ -286,6 +290,11 @@ const int vibeLength = 5;
 const int marioCoinNotes[] = {1319, 1568, 2637};
 const int marioCoinDurations[] = {60, 60, 120};
 const int marioCoinLength = 3;
+
+// Forward declaration for test status line
+void drawTestStatusLine();
+// Forward declaration for ESP-NOW send
+void sendEspNowPacket();
 
 // Double vibration pattern for flip detection (on/off in ms)
 const int doubleVibePattern[] = { 200, 100, 200, 100, 0 }; // Two vibrations with pause
@@ -704,6 +713,9 @@ void dashboardTask(void *param) {
     tft.print(" ");
     tft.print(millis() / 1000);
     tft.print("s");
+
+    // Draw battery test status line at the very end
+    drawTestStatusLine();
     
     // Handle Mario theme
     if (marioPlaying) {
@@ -779,10 +791,178 @@ void dashboardTask(void *param) {
   }
 }
 
+// --- Battery Test Mode State ---
+bool testModeActive = false;
+unsigned long testStartTime = 0;
+unsigned long lastRunSeconds = 0;
+unsigned long lastTestLog = 0;
+unsigned long lastTestBeep = 0;
+unsigned long lastTestVibe = 0;
+const unsigned long TEST_LOG_INTERVAL = 1000; // 1s
+const unsigned long TEST_BEEP_INTERVAL = 30000; // 30s
+const unsigned long TEST_VIBE_INTERVAL = 60000; // 60s
+const char* TEST_LOG_FILE = "/last_battery_test.txt";
+
+// --- Global for ESP-NOW packet counter ---
+unsigned long espnowPacketCount = 0;
+
+// --- Helper: Save last run to SPIFFS ---
+void saveLastRunToSPIFFS(unsigned long seconds) {
+  File f = SPIFFS.open(TEST_LOG_FILE, "w");
+  if (f) {
+    f.printf("%lu\n", seconds);
+    f.close();
+  }
+}
+
+// --- Helper: Load last run from SPIFFS ---
+unsigned long loadLastRunFromSPIFFS() {
+  File f = SPIFFS.open(TEST_LOG_FILE, "r");
+  if (f) {
+    String line = f.readStringUntil('\n');
+    f.close();
+    return line.toInt();
+  }
+  return 0;
+}
+
+// --- Battery Test Serial Logging ---
+void logBatteryTestData() {
+  unsigned long now = millis();
+  Serial.printf(">voltage:%lu:%.3f\n", now, batteryVoltage);
+  Serial.printf(">soc:%lu:%d\n", now, batteryPercent);
+  Serial.printf(">test:%lu:%d\n", now, testModeActive ? 1 : 0);
+}
+
+// --- Battery Test Mode Handler ---
+void handleBatteryTestMode() {
+  unsigned long now = millis();
+  // Rainbow LEDs
+  static uint8_t rainbowHue = 0;
+  for (int i = 0; i < NUM_LEDS; i++) {
+    leds[i] = CHSV(rainbowHue + (i * 256 / NUM_LEDS), 255, 128);
+  }
+  FastLED.show();
+  rainbowHue++;
+  // Beep periodically (REMOVED)
+  // if (now - lastTestBeep > TEST_BEEP_INTERVAL) {
+  //   tone(BUZZER_PIN, 1568, 100);
+  //   lastTestBeep = now;
+  // }
+  // Vibrate periodically
+  if (now - lastTestVibe > TEST_VIBE_INTERVAL) {
+    digitalWrite(VIBRATOR_PIN, HIGH);
+    delay(100);
+    digitalWrite(VIBRATOR_PIN, LOW);
+    lastTestVibe = now;
+  }
+  // ESP-NOW send at 10Hz
+  static unsigned long lastEspNow = 0;
+  if (now - lastEspNow > 100) {
+    sendEspNowPacket();
+    lastEspNow = now;
+    espnowPacketCount++;
+    if (espnowPacketCount % 100 == 0) {
+      Serial.printf("ESP-NOW packets sent: %lu\n", espnowPacketCount);
+    }
+  }
+  // Serial log
+  if (now - lastTestLog > TEST_LOG_INTERVAL) {
+    logBatteryTestData();
+    lastTestLog = now;
+  }
+  // End test if SOC <= 0
+  if (batteryPercent <= 0) {
+    testModeActive = false;
+    lastRunSeconds = (now - testStartTime) / 1000;
+    saveLastRunToSPIFFS(lastRunSeconds);
+    logBatteryTestData();
+    Serial.println("TEST END");
+    // Optionally, show a final beep
+    tone(BUZZER_PIN, 1046, 300);
+    delay(300);
+    noTone(BUZZER_PIN);
+  }
+}
+
+// --- Button Handler (middle button toggles test mode) ---
+void handleTestButton() {
+  static bool lastButtonState = false;
+  static unsigned long lastDebounce = 0;
+  bool buttonState = digitalRead(BTN_UNDER_C) == LOW; // adjust as needed
+  if (buttonState != lastButtonState) {
+    lastDebounce = millis();
+  }
+  if ((millis() - lastDebounce) > 50) {
+    if (buttonState && !testModeActive) {
+      // Start test
+      testModeActive = true;
+      testStartTime = millis();
+      lastTestLog = lastTestBeep = lastTestVibe = millis();
+      Serial.println("TEST START");
+      logBatteryTestData();
+    } else if (buttonState && testModeActive) {
+      // Stop test early
+      testModeActive = false;
+      lastRunSeconds = (millis() - testStartTime) / 1000;
+      saveLastRunToSPIFFS(lastRunSeconds);
+      Serial.println("TEST STOPPED");
+    }
+  }
+  lastButtonState = buttonState;
+}
+
+// --- Display: Add test line at bottom ---
+void drawTestStatusLine() {
+  // Draw at y=208 to ensure visibility on 240x240 displays
+  tft.fillRect(0, 208, 240, 16, ST77XX_BLACK);
+  tft.setCursor(0, 208);
+  tft.setTextColor(testModeActive ? ST77XX_YELLOW : ST77XX_WHITE);
+  if (testModeActive) {
+    tft.print("TESTING, Last Run: ");
+  } else {
+    tft.print("Last Run: ");
+  }
+  tft.print(lastRunSeconds);
+  tft.print("s");
+}
+
+// --- ESP-NOW broadcast MAC ---
+uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// --- ESP-NOW send callback ---
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("ESP-NOW send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// Dummy ESP-NOW send function
+void sendEspNowPacket() {
+  unsigned long now = millis();
+  char buf[96];
+  int len = snprintf(buf, sizeof(buf), ">voltage:%lu:%.3f\n>soc:%lu:%d\n", now, batteryVoltage, now, batteryPercent);
+  esp_now_send(broadcastAddress, (uint8_t*)buf, len); // Explicit broadcast MAC
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("Full Dashboard Test");
+
+  // Force WiFi channel 1 for ESP-NOW compatibility
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  // Initialize SPIFFS for saving test duration
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS Mount Failed");
+  } else {
+    Serial.println("SPIFFS Mounted");
+    lastRunSeconds = loadLastRunFromSPIFFS();
+    Serial.printf("Last run duration: %lu seconds\n", lastRunSeconds);
+  }
   
   // Initialize I2C for battery fuel gauge
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -853,6 +1033,28 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_R_A), handleRightEncoderA, CHANGE);
   attachInterrupt(digitalPinToInterrupt(BTN_UNDER_L), leftButtonISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_UNDER_R), rightButtonISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_UNDER_C), handleTestButton, FALLING); // Middle button for test mode
+  
+  // ESP-NOW init
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+  } else {
+    Serial.println("ESP-NOW initialized");
+    // Add broadcast peer (FF:FF:FF:FF:FF:FF)
+    esp_now_peer_info_t peerInfo = {};
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    for (int i = 0; i < 6; ++i) peerInfo.peer_addr[i] = 0xFF;
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    if (!esp_now_is_peer_exist(peerInfo.peer_addr)) {
+      if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add broadcast peer!");
+      } else {
+        Serial.println("Broadcast peer added.");
+      }
+    }
+    esp_now_register_send_cb(onDataSent);
+  }
   
   // Mark initialization complete
   dashboardReady = true;
@@ -877,6 +1079,22 @@ void loop() {
   
   // Read buttons (if needed)
   // Handle other I/O
-  
-  delay(100);
+  handleTestButton();
+  if (testModeActive) {
+    handleBatteryTestMode();
+  }
+
+  // Send ESP-NOW packet at 10Hz, always
+  static unsigned long lastEspNow = 0;
+  unsigned long now = millis();
+  if (now - lastEspNow > 100) {
+    sendEspNowPacket();
+    lastEspNow = now;
+    espnowPacketCount++;
+    if (espnowPacketCount % 100 == 0) {
+      Serial.printf("ESP-NOW packets sent: %lu\n", espnowPacketCount);
+    }
+  }
+
+  delay(10);
 } 
